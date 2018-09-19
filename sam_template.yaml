@@ -1,0 +1,59 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Resources:
+  fqndServiceGw:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: fqdnServiceGw
+      StageName: prod
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          version: "2018-06-11T16:14:04Z"
+          title: "fqdnServiceProxy"
+        paths:
+          /:
+            x-amazon-apigateway-any-method:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${fqdnServiceLamdba.Arn}/invocations"
+              responses: {}
+          /{proxy+}:
+            x-amazon-apigateway-any-method:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${fqdnServiceLamdba.Arn}/invocations"
+              responses: {}
+      Variables:
+        dbtable: !Ref fqndServiceTable
+        secret: defaultSecret
+  fqdnServiceLamdba:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: fqdnServiceLamdba
+      Handler: dnsfeedsrv.handler
+      Runtime: nodejs8.10
+      Timeout: 3
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref fqndServiceTable
+      CodeUri:
+        Bucket: oauth2shared
+        Key: dnsfeedsrv.zip
+      Events:
+        Main:
+          Type: Api
+          Properties:
+            Path: /
+            Method: ANY
+            RestApiId: !Ref fqndServiceGw
+        Wildcard:
+          Type: Api
+          Properties:
+            Path: '/{proxy+}'
+            Method: ANY
+            RestApiId: !Ref fqndServiceGw
+  fqndServiceTable:
+    Type: AWS::Serverless::SimpleTable
