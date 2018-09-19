@@ -25,7 +25,7 @@ In the AWS Console navigate to Services > API GW > fqdnServiceGw > Stages > prod
 
 The configuration must be provided as a JSON document with a free schema. Inside the JSON document you must provide *fqdn templates* conforming with the following schema:
 
-`{ "fqdn": "{full qualified domain name i.e www.paloaltonetworks.com" }`
+`{ "fqdn": "{full qualified domain name i.e www.paloaltonetworks.com}" }`
 
 At runtime, any *fqdn template* in the configuration file will be replaced with and object featuring IPv4 and IPv6 arrays provided by a DNS resolver.
 
