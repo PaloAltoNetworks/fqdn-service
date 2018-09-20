@@ -1,57 +1,18 @@
 import * as dns from "dns";
 import * as utils from "./utils";
 import * as dbif from "./dydbif";
+import * as st from "./localstore";
 
 const CFGENTRYPOINT = 'config';
+const STAGE_SECRET = 'secret';
+const STAGE_TABLE = 'dbtable';
+const QS_KEY_PARAM = 'key';
 const DEFAULT_SPAN = 86400;
 const DEFAULT_TTL = 60;
 const basicFqdnRegex = /^([a-z,0-9-_]+\.)+[a-z,0-9-_]+$/i;
 
-
 interface Request {
     fqdn: string;
-}
-
-interface Response {
-    ipv4?: String[],
-    ipv6?: String[]
-}
-
-interface fqdnLocalItem {
-    [fqdn: string]: {
-        ipv4: dbif.addrValidUntil,
-        ipv6: dbif.addrValidUntil
-    }
-}
-
-let dbEntries: fqdnLocalItem = {};
-let currentTime: number;
-
-/**
- * Checks if a item evaluated in a time window should trigger a dictionary update
- * @param item An _address:string_ , _ttl:number_ pair to be evaluated against a dictionary
- * @param dict The dictionary to evaluate (_ipv4_ / _ipv6_)
- * @param span Time window to evaluate
- * @returns _true_ if the dictionary must be updated due to the item provided being new or fresher
- */
-function ttlUpdated(item: [string, number], dict: dbif.addrValidUntil, span: number): boolean {
-    let address = item[0];
-    let validUntil = item[1];
-    if (!(address in dict) || currentTime - span > dict[address]) {
-        dict[address] = validUntil;
-        return true;
-    }
-    return false;
-}
-
-/**
- * Extract addresses from a dictionary (_ipv4_ / _ipv6_) given a time window
- * @param dict The dictionary to extract items from
- * @param span The evaluation time window
- * @returns The array of valid addresses from the dictionary in the provided time window
- */
-function validEntries(dict: dbif.addrValidUntil, span: number): string[] {
-    return Object.entries(dict).filter(item => item[1] > currentTime - span).map(item => item[0]);
 }
 
 /**
@@ -62,108 +23,137 @@ function isRequest(fqdn: Object | Request): fqdn is Request {
         basicFqdnRegex.exec((<Request>fqdn).fqdn) != null
 }
 
-/**
- * Fetchs the values of a provided fqdn from DynamoDB and stores the addreses in the _ipv4_ and _ipv6_ dictionaries
- * @param table DynamoDB table to be used in the search
- * @param fqdn The fqdn object requested
- * @returns a promise that populate the database with an empty entry or with data coming from DynamoDB
- */
-function refreshFqdnFromDb(table: string, fqdn: string): Promise<void> {
-    if (!(fqdn in dbEntries)) {
-        return dbif.safeGetById(table, fqdn).then(item => { dbEntries[fqdn] = { ipv4: item.ipv4, ipv6: item.ipv6 } });
-    }
-    return Promise.resolve();
+interface Response {
+    ipv4?: String[],
+    ipv6?: String[]
 }
 
-/**
- * Transfoms a _Request_ JS configuration entity with its corresponding _ipv4_ / _ipv6_ set of arrays given a provided time window
- * @param table DynamoDB table to be used in the search
- * @param fqdn The fqdn object requested
- * @param span Time window to evaluate
- * @param collectedResponse A collection of _ipv4_ and _ipv6_ addresses discoverd during the configuration file drill down processing
- * @returns a promise that will resolve with the transformation
- */
-function resolveDns(table: string, fqdn: string, span: number, collectedResponse: Response): Promise<Response> {
-    return refreshFqdnFromDb(table, fqdn).then(() => {
-        let localEntries: fqdnLocalItem = { [fqdn]: { ipv4: {}, ipv6: {} } };
-        let ipv4Updated: [string, number][] = [];
-        let ipv6Updated: [string, number][] = [];
-        let resolvers: Promise<void>[] = [];
-        resolvers.push(new Promise((resolve, reject) => {
-            dns.resolve4(fqdn, { ttl: true }, (err, addr) => {
-                if (err == null) {
-                    for (let i in addr) {
-                        let address = addr[i].address;
-                        let ttl = Number(addr[i].ttl);
-                        if (isNaN(ttl) || ttl == 0) ttl = DEFAULT_TTL;
-                        let validUntil = currentTime + ttl;
-                        localEntries[fqdn].ipv4[address] = validUntil;
-                    }
-                    ipv4Updated = Object.entries(localEntries[fqdn].ipv4).filter(item => ttlUpdated(item, dbEntries[fqdn].ipv4, span));
-                }
-                resolve();
-            })
-        }));
-        resolvers.push(new Promise((resolve, reject) => {
-            dns.resolve6(fqdn, { ttl: true }, (err, addr) => {
-                if (err == null) {
-                    for (let i in addr) {
-                        let address = addr[i].address;
-                        let ttl = Number(addr[i].ttl);
-                        if (isNaN(ttl) || ttl == 0) ttl = DEFAULT_TTL;
-                        let validUntil = currentTime + ttl;
-                        localEntries[fqdn].ipv6[address] = validUntil;
-                    }
-                    ipv6Updated = Object.entries(localEntries[fqdn].ipv6).filter(item => ttlUpdated(item, dbEntries[fqdn].ipv6, span));
-                }
-                resolve();
-            })
-        }));
-        return Promise.all(resolvers).then(() => {
-            if (ipv4Updated.length + ipv6Updated.length > 0) {
-                return dbif.putItem(table, {
-                    id: fqdn,
-                    ipv4: dbEntries[fqdn].ipv4,
-                    ipv6: dbEntries[fqdn].ipv6
-                });
+let currentTime: number;
+let stagedServices: { [configName: string]: fqdnService } = {};
+let dbClient: dbif.dydbif;
+let storedItems: st.storage;
+
+class fqdnService {
+    serviceConfig: Object;
+    private dbClient: dbif.dydbif;
+    private extStore: st.storage
+    responseBuffer: Response
+
+    constructor(serviceConfig: Object, dbclient: dbif.dydbif, extStore: st.storage) {
+        this.serviceConfig = serviceConfig;
+        this.dbClient = dbclient;
+        this.extStore = extStore;
+        this.responseBuffer = {};
+    }
+
+    resetBuffer() {
+        this.responseBuffer = {};
+    }
+
+    /**
+     * Fetchs the values of a provided fqdn from DynamoDB and stores the addreses in the _ipv4_ and _ipv6_ dictionaries
+     * @param fqdn The fqdn object requested
+     * @returns a promise that populate the database with an empty entry or with data coming from DynamoDB
+     */
+    refreshFqdnFromDb(fqdn: string): Promise<void> {
+        if (!this.extStore.hasFqdn(fqdn)) {
+            return this.dbClient.safeGetById(fqdn).then(item => { this.extStore.setFqdn(fqdn, { ipv4: item.ipv4, ipv6: item.ipv6 }) });
+        }
+        return Promise.resolve();
+    }
+
+    /**
+     * Recursive function to drill down the provided configuration file
+     * @param arg JS element to process
+     * @param span Time window to evaluate
+     * @returns _arg_ as is or transformed if _arg_ is a _Request_
+     */
+    drillDown(arg: any, span: number): Promise<any> {
+        if (isRequest(arg)) {
+            return this.resolveDns(arg.fqdn, span);
+        } else if (typeof arg == "object") {
+            let keyPromises: Promise<any>[] = [];
+            for (let k in arg) {
+                keyPromises.push(this.drillDown(arg[k], span).then(r => arg[k] = r));
             }
-            return Promise.resolve();
-        });
-    }).then(() => {
-        let response: Response = {};
-        let ipv4Entries = validEntries(dbEntries[fqdn].ipv4, span);
-        let ipv6Entries = validEntries(dbEntries[fqdn].ipv6, span);
-        if (ipv4Entries.length > 0) {
-            response.ipv4 = ipv4Entries;
-            collectedResponse.ipv4 = collectedResponse.ipv4 ? collectedResponse.ipv4.concat(ipv4Entries) : ipv4Entries;
+            return Promise.all(keyPromises).then(() => arg);
         }
-        if (ipv6Entries.length > 0) {
-            response.ipv6 = ipv6Entries
-            collectedResponse.ipv6 = collectedResponse.ipv6 ? collectedResponse.ipv6.concat(ipv6Entries) : ipv6Entries;
-        };
-        return response;
-    });
+        return Promise.resolve(arg);
+    }
+
+    /**
+     * Transfoms a _Request_ JS configuration entity with its corresponding _ipv4_ / _ipv6_ set of arrays given a provided time window
+     * @param fqdn The fqdn object requested
+     * @param span Time window to evaluate
+     * @returns a promise that will resolve with the transformation
+     */
+    resolveDns(fqdn: string, span: number): Promise<Response> {
+        return this.refreshFqdnFromDb(fqdn).then(() => {
+            let localEntries: st.fqdnLocalItem = { [fqdn]: { ipv4: {}, ipv6: {} } };
+            let ipv4Updated: [string, number][] = [];
+            let ipv6Updated: [string, number][] = [];
+            let resolvers: Promise<void>[] = [];
+            resolvers.push(new Promise((resolve, reject) => {
+                dns.resolve4(fqdn, { ttl: true }, (err, addr) => {
+                    if (err == null) {
+                        for (let i in addr) {
+                            let address = addr[i].address;
+                            let ttl = Number(addr[i].ttl);
+                            if (isNaN(ttl) || ttl == 0) ttl = DEFAULT_TTL;
+                            let validUntil = currentTime + ttl;
+                            localEntries[fqdn].ipv4[address] = validUntil;
+                        }
+                        ipv4Updated = Object.entries(localEntries[fqdn].ipv4).filter(
+                            item => this.extStore.ttlUpdated4(fqdn, item, span, currentTime));
+                    }
+                    resolve();
+                })
+            }));
+            resolvers.push(new Promise((resolve, reject) => {
+                dns.resolve6(fqdn, { ttl: true }, (err, addr) => {
+                    if (err == null) {
+                        for (let i in addr) {
+                            let address = addr[i].address;
+                            let ttl = Number(addr[i].ttl);
+                            if (isNaN(ttl) || ttl == 0) ttl = DEFAULT_TTL;
+                            let validUntil = currentTime + ttl;
+                            localEntries[fqdn].ipv6[address] = validUntil;
+                        }
+                        ipv6Updated = Object.entries(localEntries[fqdn].ipv6).filter(
+                            item => this.extStore.ttlUpdated6(fqdn, item, span, currentTime));
+                    }
+                    resolve();
+                })
+            }));
+            return Promise.all(resolvers).then(() => {
+                if (ipv4Updated.length + ipv6Updated.length > 0) {
+                    return this.dbClient.putItem({
+                        id: fqdn,
+                        ipv4: this.extStore.get4(fqdn),
+                        ipv6: this.extStore.get6(fqdn)
+                    });
+                }
+                return Promise.resolve();
+            });
+        }).then(() => {
+            let response: Response = {};
+            let ipv4Entries = this.extStore.validEntries4(fqdn, span, currentTime);
+            let ipv6Entries = this.extStore.validEntries6(fqdn, span, currentTime);
+            if (ipv4Entries.length > 0) {
+                response.ipv4 = ipv4Entries;
+                this.responseBuffer.ipv4 = this.responseBuffer.ipv4 ? this.responseBuffer.ipv4.concat(ipv4Entries) : ipv4Entries;
+            }
+            if (ipv6Entries.length > 0) {
+                response.ipv6 = ipv6Entries
+                this.responseBuffer.ipv6 = this.responseBuffer.ipv6 ? this.responseBuffer.ipv6.concat(ipv6Entries) : ipv6Entries;
+            };
+            return response;
+        });
+    }
 }
 
-/**
- * Recursive function to drill down the provided configuration file
- * @param table DynamoDB table to be used in the search
- * @param arg JS element to process
- * @param span Time window to evaluate
- * @param collectedResponse A collection of _ipv4_ and _ipv6_ addresses discoverd during the configuration file drill down processing
- * @returns _arg_ as is or transformed if _arg_ is a _Request_
- */
-function drillDown(table: string, arg: any, span: number, collectedResponse: Response): Promise<any> {
-    if (isRequest(arg)) {
-        return resolveDns(table, arg.fqdn, span, collectedResponse);
-    } else if (typeof arg == "object") {
-        let keyPromises: Promise<any>[] = [];
-        for (let k in arg) {
-            keyPromises.push(drillDown(table, arg[k], span, collectedResponse).then(r => arg[k] = r));
-        }
-        return Promise.all(keyPromises).then(() => arg);
-    }
-    return Promise.resolve(arg);
+function fqdnServiceFactory(configFile: string, dbClient: dbif.dydbif, stor: st.storage): Promise<fqdnService> {
+    return dbClient.getConfig(configFile).then(cfg => new fqdnService(cfg, dbClient, stor));
 }
 
 /**
@@ -174,14 +164,22 @@ exports.handler = async function (event: AWSLambda.APIGatewayProxyEvent,
     callback: AWSLambda.APIGatewayProxyCallback): Promise<AWSLambda.APIGatewayProxyResult> {
 
     currentTime = Date.now() / 1000 | 0;
-    let collectedResponse: Response = {};
     let stageVars = event.stageVariables;
-    let missingVars = [dbif.STAGE_SECRET, dbif.STAGE_TABLE].filter(v => stageVars ? !(v in stageVars) : true);
+    let missingVars = [STAGE_SECRET, STAGE_TABLE].filter(v => stageVars ? !(v in stageVars) : true);
     if (missingVars.length != 0) return utils.response501('"' + missingVars.toString() + '" stage variable(s) not set.');
-    let table = event.stageVariables ? event.stageVariables[dbif.STAGE_TABLE] : 'dnsfeedsrv';
+    let table = event.stageVariables ? event.stageVariables[STAGE_TABLE] : 'fqdnfeedsrv';
+
+    if (dbClient == null) {
+        dbClient = new dbif.dydbif(table);
+    }
+
+    if (storedItems == null) {
+        storedItems = new st.storage();
+    }
+
     let pathTokens = event.path.split('/');
     if (pathTokens[pathTokens.length - 1] == CFGENTRYPOINT) {
-        return dbif.configHandler(event);
+        return configHandler(event, table);
     }
 
     let span = DEFAULT_SPAN;
@@ -191,12 +189,66 @@ exports.handler = async function (event: AWSLambda.APIGatewayProxyEvent,
         if (!Number.isNaN(parsedScope) && parsedScope != 0) span = parsedScope;
     }
 
-    return dbif.getConfig(table, utils.configFileName(event)).then(db => drillDown(table, db, span, collectedResponse).then(() => db)).then(db => {
-        if (qs === null || qs === undefined || ("v" in qs && qs["v"] == "ipv4")) {
-            return utils.responsePlain(collectedResponse.ipv4 ? collectedResponse.ipv4.join("\n") : "");
-        } else if ("v" in qs && qs["v"] == "ipv6") {
-            return utils.responsePlain(collectedResponse.ipv6 ? collectedResponse.ipv6.join("\n") : "");
-        }
-        return utils.responseJson(db);
+    let configFile = utils.configFileName(event);
+    let fqdnServiceInstance: Promise<fqdnService>;
+    if (!(configFile in stagedServices)) {
+        fqdnServiceInstance = fqdnServiceFactory(configFile, dbClient, storedItems).then(fs => {
+            stagedServices[configFile] = fs; return fs
+        });
+    } else {
+        fqdnServiceInstance = Promise.resolve(stagedServices[configFile]);
+    }
+
+    return fqdnServiceInstance.then(fs => {
+        fs.resetBuffer();
+        let workableConfig: Object = JSON.parse(JSON.stringify(fs.serviceConfig));
+        return fs.drillDown(workableConfig, span).then(processedConfig => {
+            if (qs === null || qs === undefined || ("v" in qs && qs["v"] == "ipv4")) {
+                return utils.responsePlain(fs.responseBuffer.ipv4 ? fs.responseBuffer.ipv4.join("\n") : "");
+            } else if ("v" in qs && qs["v"] == "ipv6") {
+                return utils.responsePlain(fs.responseBuffer.ipv6 ? fs.responseBuffer.ipv6.join("\n") : "");
+            }
+            return utils.responseJson(processedConfig);
+        })
     }).catch(e => utils.response501(e));
+}
+
+/**
+ * AWS API GW proxy mode integration handler for the _/config_ entry point
+ */
+export function configHandler(event: AWSLambda.APIGatewayProxyEvent, table: string): Promise<AWSLambda.APIGatewayProxyResult> {
+    let qs = event.queryStringParameters;
+    let secret = event.stageVariables ? event.stageVariables[STAGE_SECRET] : event.requestContext.requestId;
+    if (!(qs != null && QS_KEY_PARAM in qs && secret == qs[QS_KEY_PARAM])) {
+        return utils.response403('Invalid or missing key');
+    }
+    let configFile = utils.configFileName(event);
+    switch (event.requestContext.httpMethod) {
+        case "GET": {
+            return dbClient.getConfig(configFile).then(r => utils.responseJson(r)).catch(e => utils.response501(e));
+        }
+        case "POST": {
+            if (event.body == null) {
+                return utils.response501("Null body in POST request.");
+            }
+            let configBody = {};
+            try {
+                configBody = JSON.parse(event.body);
+            } catch (err) {
+                return utils.response501("Error parsing JSON configuration content.");
+            }
+            if (typeof configBody != "object") {
+                return utils.response501("Configuration provided is not a JSON object");
+            }
+            return dbClient.putNewConfig(configFile, configBody).then(data => {
+                if (configFile in stagedServices) {
+                    stagedServices[configFile].serviceConfig = data;
+                } else {
+                    stagedServices[configFile] = new fqdnService(data, dbClient, storedItems);
+                }
+                return utils.responseJson(data);
+            }).catch(e => utils.response501(e));
+        }
+    }
+    return utils.response501('HTTP Method not implemented.');
 }

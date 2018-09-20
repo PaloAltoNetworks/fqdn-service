@@ -1,3 +1,9 @@
+export const DBKEY = 'id';
+
+export interface addrValidUntil {
+    [address: string]: number
+}
+
 function apiGwResponse(code: number, type: string, message: string): Promise<AWSLambda.APIGatewayProxyResult> {
     return Promise.resolve({
         statusCode: code,

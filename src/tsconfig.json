@@ -12,7 +12,8 @@
     "files": [
         "dnsfeedsrv.ts",
         "dydbif.ts",
-        "utils.ts"
+        "utils.ts",
+        "localstore.ts"
     ]
 }
 
