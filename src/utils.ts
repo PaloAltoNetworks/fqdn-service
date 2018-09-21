@@ -4,6 +4,16 @@ export interface addrValidUntil {
     [address: string]: number
 }
 
+let cTime: number = 0;
+
+export function currentTime(): number {
+    return cTime;
+}
+
+export function setCurrentTime(): void {
+    cTime = Date.now() / 1000 | 0;
+}
+
 function apiGwResponse(code: number, type: string, message: string): Promise<AWSLambda.APIGatewayProxyResult> {
     return Promise.resolve({
         statusCode: code,

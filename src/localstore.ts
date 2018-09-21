@@ -25,28 +25,29 @@ export class storage {
     }
 
     /**
-     * Checks if a item evaluated in a time window should trigger a dictionary update
+     * Checks if a item evaluated in a time window should trigger a dictionary update. Take advantage of the opportunity to update the
+     * local storage if needed
      * @param item An _address:string_ , _ttl:number_ pair to be evaluated against a dictionary
      * @param dict The dictionary to evaluate (_ipv4_ / _ipv6_)
      * @param span Time window to evaluate
      * @returns _true_ if the dictionary must be updated due to the item provided being new or fresher
      */
-    private ttlUpdated(item: [string, number], dict: utils.addrValidUntil, span: number, currentTime: number): boolean {
+    private ttlUpdated(item: [string, number], dict: utils.addrValidUntil, span: number): boolean {
         let address = item[0];
         let validUntil = item[1];
-        if (!(address in dict) || currentTime - span > dict[address]) {
+        if (!(address in dict) || utils.currentTime() - span > dict[address]) {
             dict[address] = validUntil;
             return true;
         }
         return false;
     }
 
-    ttlUpdated4(fqdn: string, item: [string, number], span: number, currentTime: number): boolean {
-        return this.ttlUpdated(item, this.localDict[fqdn].ipv4, span, currentTime);
+    ttlUpdated4(fqdn: string, item: [string, number], span: number): boolean {
+        return this.ttlUpdated(item, this.localDict[fqdn].ipv4, span);
     }
 
-    ttlUpdated6(fqdn: string, item: [string, number], span: number, currentTime: number): boolean {
-        return this.ttlUpdated(item, this.localDict[fqdn].ipv6, span, currentTime);
+    ttlUpdated6(fqdn: string, item: [string, number], span: number): boolean {
+        return this.ttlUpdated(item, this.localDict[fqdn].ipv6, span);
     }
 
     /**
@@ -55,16 +56,16 @@ export class storage {
      * @param span The evaluation time window
      * @returns The array of valid addresses from the dictionary in the provided time window
      */
-    private validEntries(dict: utils.addrValidUntil, span: number, currentTime: number): string[] {
-        return Object.entries(dict).filter(item => item[1] > currentTime - span).map(item => item[0]);
+    private validEntries(dict: utils.addrValidUntil, span: number): string[] {
+        return Object.entries(dict).filter(item => item[1] > utils.currentTime() - span).map(item => item[0]);
     }
 
-    validEntries4(fqdn: string, span: number, currentTime: number): string[] {
-        return this.validEntries(this.localDict[fqdn].ipv4, span, currentTime);
+    validEntries4(fqdn: string, span: number): string[] {
+        return this.validEntries(this.localDict[fqdn].ipv4, span);
     }
 
-    validEntries6(fqdn: string, span: number, currentTime: number): string[] {
-        return this.validEntries(this.localDict[fqdn].ipv6, span, currentTime);
+    validEntries6(fqdn: string, span: number): string[] {
+        return this.validEntries(this.localDict[fqdn].ipv6, span);
     }
 
     get4(fqdn: string): utils.addrValidUntil {
