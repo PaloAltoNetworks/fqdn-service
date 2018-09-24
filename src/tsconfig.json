@@ -3,10 +3,10 @@
         "noImplicitAny": true,
         "strictNullChecks": true,
         "allowJs": true,
-        "target": "ES2017",
+        "target": "es2017",
         "module": "commonjs",
         "lib": [
-            "ES2017"
+            "es2017"
         ]
     },
     "files": [
