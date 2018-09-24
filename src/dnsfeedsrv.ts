@@ -63,11 +63,6 @@ interface Response {
 let stagedServices: { [configName: string]: fqdnService } = {};
 
 /**
- * Singleton client interface to the database it will be instantiated the first time AWS API GW invokes the handler
- */
-let dbClient: dbif.dydbif;
-
-/**
  * Singleton memory storage object
  */
 let storedItems = new st.storage();;
@@ -80,7 +75,11 @@ class fqdnService {
     /**
      * Instance configuration
      */
-    serviceConfig: Object;
+    serviceConfig: Object
+    /**
+     * DynamoDB client
+     */
+    dbClient: dbif.dydbif;
 
     /**
      * Temporary buffer to store all IPv4 and IPv6 addresses discovered while drilling down
@@ -91,10 +90,36 @@ class fqdnService {
     /**
      * 
      * @param serviceConfig fqdn service configuration file
+     * @param dbClient DynamoDB client
      */
-    constructor(serviceConfig: Object) {
+    constructor(configFile: string, serviceConfig: Object, dbClient: dbif.dydbif) {
         this.serviceConfig = serviceConfig;
+        this.dbClient = dbClient;
         this.responseBuffer = {};
+    }
+
+    private res4wraper(fqdn: string): Promise<dns.RecordWithTtl[]> {
+        return new Promise((resolve, reject) => {
+            dns.resolve4(fqdn, { ttl: true }, (err, addr) => {
+                if (err == null) {
+                    resolve(addr);
+                    return;
+                }
+                resolve([]);
+            })
+        })
+    }
+
+    private res6wraper(fqdn: string): Promise<dns.RecordWithTtl[]> {
+        return new Promise((resolve, reject) => {
+            dns.resolve6(fqdn, { ttl: true }, (err, addr) => {
+                if (err == null) {
+                    resolve(addr);
+                    return;
+                }
+                resolve([]);
+            })
+        })
     }
 
     /**
@@ -102,11 +127,11 @@ class fqdnService {
      * @param fqdn The fqdn object requested
      * @returns a promise that populate the database with an empty entry or with data coming from DynamoDB
      */
-    private refreshFqdnFromDb(fqdn: string): Promise<void> {
+    private async refreshFqdnFromDb(fqdn: string): Promise<void> {
         if (!storedItems.hasFqdn(fqdn)) {
-            return dbClient.safeGetById(fqdn).then(item => { storedItems.setFqdn(fqdn, { ipv4: item.ipv4, ipv6: item.ipv6 }) });
+            let item = await this.dbClient.safeGetById(fqdn);
+            storedItems.setFqdn(fqdn, { ipv4: item.ipv4, ipv6: item.ipv6 });
         }
-        return Promise.resolve();
     }
 
     /**
@@ -131,11 +156,11 @@ class fqdnService {
         if (isRequest(arg)) {
             return this.resolveDns(arg.fqdn, span);
         } else if (typeof arg == "object") {
-            let keyPromises: Promise<any>[] = [];
+            let promisePool: Promise<any>[] = [];
             for (let k in arg) {
-                keyPromises.push(this.drillDown(arg[k], span).then(r => arg[k] = r));
+                promisePool.push(this.drillDown(arg[k], span).then(a => arg[k] = a));
             }
-            return Promise.all(keyPromises).then(() => arg);
+            return Promise.all(promisePool).then(() => arg);
         }
         return Promise.resolve(arg);
     }
@@ -148,85 +173,70 @@ class fqdnService {
      * @param span Time window to evaluate
      * @returns a promise that will resolve with the transformation
      */
-    private resolveDns(fqdn: string, span: number): Promise<Response> {
-        return this.refreshFqdnFromDb(fqdn).then(() => {
-            let localEntries: st.fqdnLocalItem = { [fqdn]: { ipv4: {}, ipv6: {} } };
-            let ipv4Updated: [string, number][] = [];
-            let ipv6Updated: [string, number][] = [];
-            let resolvers: Promise<void>[] = [];
-            resolvers.push(new Promise((resolve, reject) => {
-                dns.resolve4(fqdn, { ttl: true }, (err, addr) => {
-                    if (err == null) {
-                        for (let i in addr) {
-                            let address = addr[i].address;
-                            let ttl = Number(addr[i].ttl);
-                            if (isNaN(ttl) || ttl == 0) ttl = DEFAULT_TTL;
-                            let validUntil = utils.currentTime() + ttl;
-                            localEntries[fqdn].ipv4[address] = validUntil;
-                        }
-                        // Keep only these ipv4 addresses in the response that 1) are not known to the local storage or 2) wouldn't be
-                        // selected due to expired TTL. The [[ttlUpdated4]] method takes advantage of the opportunity to update the local
-                        // storage with these entries.
-                        ipv4Updated = Object.entries(localEntries[fqdn].ipv4).filter(
-                            item => storedItems.ttlUpdated4(fqdn, item, span));
-                    }
-                    resolve();
-                })
-            }));
-            resolvers.push(new Promise((resolve, reject) => {
-                dns.resolve6(fqdn, { ttl: true }, (err, addr) => {
-                    if (err == null) {
-                        for (let i in addr) {
-                            let address = addr[i].address;
-                            let ttl = Number(addr[i].ttl);
-                            if (isNaN(ttl) || ttl == 0) ttl = DEFAULT_TTL;
-                            let validUntil = utils.currentTime() + ttl;
-                            localEntries[fqdn].ipv6[address] = validUntil;
-                        }
-                        ipv6Updated = Object.entries(localEntries[fqdn].ipv6).filter(
-                            item => storedItems.ttlUpdated6(fqdn, item, span));
-                    }
-                    resolve();
-                })
-            }));
-            return Promise.all(resolvers).then(() => {
-                // If we have updated items then it is time to update the fqdn in the DynamoDB Table
-                if (ipv4Updated.length + ipv6Updated.length > 0) {
-                    return dbClient.putItem({
-                        id: fqdn,
-                        ipv4: storedItems.get4(fqdn),
-                        ipv6: storedItems.get6(fqdn)
-                    });
-                }
-                return Promise.resolve();
+    private async resolveDns(fqdn: string, span: number): Promise<Response> {
+        await this.refreshFqdnFromDb(fqdn);
+        let localEntries: st.fqdnLocalItem = { [fqdn]: { ipv4: {}, ipv6: {} } };
+        let ipv4Updated: [string, number][] = [];
+        let ipv6Updated: [string, number][] = [];
+        let addr4 = await this.res4wraper(fqdn);
+        for (let i in addr4) {
+            let address = addr4[i].address;
+            let ttl = Number(addr4[i].ttl);
+            if (isNaN(ttl) || ttl == 0) ttl = DEFAULT_TTL;
+            let validUntil = utils.currentTime() + ttl;
+            localEntries[fqdn].ipv4[address] = validUntil;
+        }
+        // Keep only these ipv4 addresses in the response that 1) are not known to the local storage or 2) wouldn't be
+        // selected due to expired TTL. The [[ttlUpdated4]] method takes advantage of the opportunity to update the local
+        // storage with these entries.
+        ipv4Updated = Object.entries(localEntries[fqdn].ipv4).filter(
+            item => storedItems.ttlUpdated4(fqdn, item, span));
+        let addr6 = await this.res6wraper(fqdn);
+        for (let i in addr6) {
+            let address = addr6[i].address;
+            let ttl = Number(addr6[i].ttl);
+            if (isNaN(ttl) || ttl == 0) ttl = DEFAULT_TTL;
+            let validUntil = utils.currentTime() + ttl;
+            localEntries[fqdn].ipv6[address] = validUntil;
+        }
+        ipv6Updated = Object.entries(localEntries[fqdn].ipv6).filter(
+            item => storedItems.ttlUpdated6(fqdn, item, span));
+
+        if (ipv4Updated.length + ipv6Updated.length > 0)
+            this.dbClient.putItem({
+                id: fqdn,
+                ipv4: storedItems.get4(fqdn),
+                ipv6: storedItems.get6(fqdn)
             });
-        }).then(() => {
-            // Time to format and return a response with valid entries from the local storage.
-            let response: Response = {};
-            let ipv4Entries = storedItems.validEntries4(fqdn, span);
-            let ipv6Entries = storedItems.validEntries6(fqdn, span);
-            if (ipv4Entries.length > 0) {
-                response.ipv4 = ipv4Entries;
-                this.responseBuffer.ipv4 = this.responseBuffer.ipv4 ?
-                    this.responseBuffer.ipv4.concat(ipv4Entries) : ipv4Entries;
-            }
-            if (ipv6Entries.length > 0) {
-                response.ipv6 = ipv6Entries
-                this.responseBuffer.ipv6 = this.responseBuffer.ipv6 ?
-                    this.responseBuffer.ipv6.concat(ipv6Entries) : ipv6Entries;
-            };
-            return response;
-        });
+
+        // Time to format and return a response with valid entries from the local storage.
+        let response: Response = {};
+        let ipv4Entries = storedItems.validEntries4(fqdn, span);
+        let ipv6Entries = storedItems.validEntries6(fqdn, span);
+        if (ipv4Entries.length > 0) {
+            response.ipv4 = ipv4Entries;
+            this.responseBuffer.ipv4 = this.responseBuffer.ipv4 ?
+                this.responseBuffer.ipv4.concat(ipv4Entries) : ipv4Entries;
+        }
+        if (ipv6Entries.length > 0) {
+            response.ipv6 = ipv6Entries
+            this.responseBuffer.ipv6 = this.responseBuffer.ipv6 ?
+                this.responseBuffer.ipv6.concat(ipv6Entries) : ipv6Entries;
+        };
+        return response;
     }
 }
 
 /**
  * [[fqdnService]] object async instantiation factory
+ * @param table DynamoDB table this service must work on
  * @param configFile ID of the config file inside DynamoDB this service instance should work with
  * @returns a promise the instance will be created with the configuration body retrieved from DynamoDB
  */
-function fqdnServiceFactory(configFile: string): Promise<fqdnService> {
-    return dbClient.getConfig(configFile).then(cfg => new fqdnService(cfg));
+async function fqdnServiceFactory(table: string, configFile: string): Promise<fqdnService> {
+    let dbClient = new dbif.dydbif(table);
+    let configBody = await dbClient.getConfig(configFile);
+    return new fqdnService(configFile, configBody, dbClient);
 }
 
 /**
@@ -244,15 +254,26 @@ exports.handler = async function (event: AWSLambda.APIGatewayProxyEvent,
     if (missingVars.length != 0) return utils.response501('"' + missingVars.toString() + '" stage variable(s) not set.');
     let table = event.stageVariables ? event.stageVariables[STAGE_TABLE] : 'fqdnfeedsrv';
 
-    // dbclient singleton initialization
-    if (dbClient == null) {
-        dbClient = new dbif.dydbif(table);
-    }
+    // service config name (id) is a unique value composed by the AWS API GW id and stage strings
+    let configFile = utils.configFileName(event);
 
     // check if the request should be managed by the _configuration_ handler
     let pathTokens = event.path.split('/');
     if (pathTokens[pathTokens.length - 1] == CFGENTRYPOINT) {
-        return configHandler(event, table);
+        return configHandler(event, table, configFile);
+    }
+
+    let fs: fqdnService;
+    // get the configuration either from the local repository (cached) or for DynamoDB (first time after module initialization)
+    if (configFile in stagedServices) {
+        fs = stagedServices[configFile];
+    } else {
+        try {
+            fs = await fqdnServiceFactory(table, configFile);
+        } catch (e) {
+            return utils.response501(e);
+        }
+        stagedServices[configFile] = fs;
     }
 
     // extract optional [[DEFAULT_SPAN]] query parameter
@@ -263,45 +284,32 @@ exports.handler = async function (event: AWSLambda.APIGatewayProxyEvent,
         if (!Number.isNaN(parsedScope) && parsedScope != 0) span = parsedScope;
     }
 
-    // service config name (id) is a unique value composed by the AWS API GW id and stage strings
-    let configFile = utils.configFileName(event);
-    let fqdnServiceInstance: Promise<fqdnService>;
-    // get the configuration either from the local repository (cached) or for DynamoDB (first time after module initialization)
-    if (configFile in stagedServices) {
-        fqdnServiceInstance = Promise.resolve(stagedServices[configFile]);
-    } else {
-        fqdnServiceInstance = fqdnServiceFactory(configFile).then(fs => {
-            stagedServices[configFile] = fs; return fs
-        });
-    }
-
     // format a response or return a 501 error code if anything in the promise chain goes wrong
-    return fqdnServiceInstance.then(fs => {
-        return fs.process(span).then(processedConfig => {
-            if (qs === null || qs === undefined || ("v" in qs && qs["v"] == "ipv4")) {
-                return utils.responsePlain(fs.responseBuffer.ipv4 ? fs.responseBuffer.ipv4.join("\n") : "");
-            } else if ("v" in qs && qs["v"] == "ipv6") {
-                return utils.responsePlain(fs.responseBuffer.ipv6 ? fs.responseBuffer.ipv6.join("\n") : "");
-            }
-            return utils.responseJson(processedConfig);
-        })
-    }).catch(e => utils.response501(e));
+    try {
+        let processedConfig = await fs.process(span);
+        if (qs === null || qs === undefined || ("v" in qs && qs["v"] == "ipv4")) {
+            return utils.responsePlain(fs.responseBuffer.ipv4 ? fs.responseBuffer.ipv4.join("\n") : "");
+        } else if ("v" in qs && qs["v"] == "ipv6") {
+            return utils.responsePlain(fs.responseBuffer.ipv6 ? fs.responseBuffer.ipv6.join("\n") : "");
+        }
+        return utils.responseJson(processedConfig);
+    } catch (e) {
+        return utils.response501(e);
+    }
 }
 
 /**
  * AWS API GW proxy mode integration handler for the _/config_ entry point
  */
-export function configHandler(event: AWSLambda.APIGatewayProxyEvent, table: string): Promise<AWSLambda.APIGatewayProxyResult> {
+export async function configHandler(event: AWSLambda.APIGatewayProxyEvent,
+    table: string,
+    configFile: string): Promise<AWSLambda.APIGatewayProxyResult> {
     let qs = event.queryStringParameters;
     let secret = event.stageVariables ? event.stageVariables[STAGE_SECRET] : event.requestContext.requestId;
     if (!(qs != null && QS_KEY_PARAM in qs && secret == qs[QS_KEY_PARAM])) {
         return utils.response403('Invalid or missing key');
     }
-    let configFile = utils.configFileName(event);
     switch (event.requestContext.httpMethod) {
-        case "GET": {
-            return dbClient.getConfig(configFile).then(r => utils.responseJson(r)).catch(e => utils.response501(e));
-        }
         case "POST": {
             if (event.body == null) {
                 return utils.response501("Null body in POST request.");
@@ -315,14 +323,31 @@ export function configHandler(event: AWSLambda.APIGatewayProxyEvent, table: stri
             if (typeof configBody != "object") {
                 return utils.response501("Configuration provided is not a JSON object");
             }
-            return dbClient.putNewConfig(configFile, configBody).then(data => {
-                if (configFile in stagedServices) {
-                    stagedServices[configFile].serviceConfig = data;
-                } else {
-                    stagedServices[configFile] = new fqdnService(data);
+            let fs: fqdnService;
+            // get the configuration either from the local repository (cached) or for DynamoDB (first time after module initialization)
+            if (configFile in stagedServices) {
+                fs = stagedServices[configFile];
+                try {
+                    await fs.dbClient.putNewConfig(configFile, configBody);
+                } catch (e) {
+                    return utils.response501(e);
                 }
-                return utils.responseJson(data);
-            }).catch(e => utils.response501(e));
+                stagedServices[configFile].serviceConfig = configBody;
+                return utils.responseJson(configBody);
+            }
+            let dbClient = new dbif.dydbif(table);
+            try {
+                await dbClient.putNewConfig(configFile, configBody);
+            } catch (e) {
+                return utils.response501(e);
+            }
+            stagedServices[configFile] = new fqdnService(configFile, configBody, dbClient);
+            try {
+                fs = await fqdnServiceFactory(table, configFile);
+            } catch (e) {
+                return utils.response501(e);
+            }
+            stagedServices[configFile] = fs;
         }
     }
     return utils.response501('HTTP Method not implemented.');

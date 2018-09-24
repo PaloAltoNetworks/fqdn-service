@@ -55,8 +55,8 @@ export class dydbif {
      * @param configBody Configuration file content
      * @returns a promise that will resolve with the configuration file content (echo back)
      */
-    putNewConfig(configFile: string, configBody: Object): Promise<aws.DynamoDB.DocumentClient.PutItemOutput> {
-        return new Promise<aws.DynamoDB.DocumentClient.PutItemOutput>((resolve, reject) => docuClient.put({
+    putNewConfig(configFile: string, configBody: Object): Promise<void> {
+        return new Promise<void>((resolve, reject) => docuClient.put({
             TableName: this.tableName,
             Item: {
                 [utils.DBKEY]: configFile,
@@ -66,7 +66,7 @@ export class dydbif {
             if (err != null) {
                 reject(err.message);
             } else {
-                resolve(configBody);
+                resolve();
             }
         }))
     }
