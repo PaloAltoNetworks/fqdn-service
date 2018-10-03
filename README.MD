@@ -9,7 +9,7 @@ Using L7 security policies is the right solution to the problem. But, if for any
 
 ## Installation
 
-Just deploy the Serverless Application from the AWS Serverless Repo at [pending] or create a _CloudFormation Stack_ using the template [sam_template.yaml](sam_template.yaml)
+Just deploy the Serverless Application from the [AWS Serverless Repo](https://serverlessrepo.aws.amazon.com/#/applications/arn:aws:serverlessrepo:us-east-1:298629197879:applications~fqdnService) or create a _CloudFormation Stack_ using the template [sam_template.yaml](sam_template.yaml)
 
 ## Configuration
 
