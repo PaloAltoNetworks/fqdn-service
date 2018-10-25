@@ -34,7 +34,7 @@ Example Configuration File:
 ```json
 {
     "UPF": { "fqdn": "www.upf.edu" },
-    "UB": { "fqdn": "www.ub.es" }
+    "UB": { "fqdn": "www.ub.cat" }
 }
 ```
 
